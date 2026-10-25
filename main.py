@@ -9,9 +9,12 @@ COINBASE_URL = (
     "https://api.exchange.coinbase.com/products/"
     "BTC-USD/candles"
 )
+
 YAHOO_URL = (
     "https://query1.finance.yahoo.com/v8/finance/chart/"
-    "XAUUSD%3DX"
+    "GC%3DF"
+)
+
 )
 
 TIMEFRAME_SECONDS = 900
