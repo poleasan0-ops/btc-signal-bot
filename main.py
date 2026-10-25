@@ -194,27 +194,38 @@ def send_telegram(message):
         raise RuntimeError("Telegram rejected the message.")
 
 
+
 def main():
-    signal = analyze()
+    try:
+        signal = analyze()
 
-    if signal is None:
-        return
+        if signal is None:
+            message = (
+                "BTC-USD | STATUS\n"
+                "Bot is running correctly.\n"
+                "No BUY/SELL signal at this time.\n"
+                "Timeframe: 15m\n"
+                "The next scheduled check will run automatically."
+            )
+        else:
+            message = (
+                f"BTC-USD | {signal['side']}\n"
+                f"Timeframe: 15m\n"
+                f"Entry reference: {signal['price']:.2f}\n"
+                f"Stop-loss reference: {signal['stop']:.2f}\n"
+                f"Take-profit reference: {signal['target']:.2f}\n"
+                f"RSI: {signal['rsi']:.1f}\n"
+                f"Candle: {signal['time']}\n\n"
+                "Rule-based technical signal, not a guarantee."
+            )
 
-    message = (
-        f"BTC-USD | {signal['side']}\n"
-        f"Timeframe: 15m\n"
-        f"Entry reference: {signal['price']:.2f}\n"
-        f"Stop-loss reference: {signal['stop']:.2f}\n"
-        f"Take-profit reference: {signal['target']:.2f}\n"
-        f"RSI: {signal['rsi']:.1f}\n"
-        f"Candle: {signal['time']}\n\n"
-        "Rule-based technical signal, not a guarantee."
-    )
+        send_telegram(message)
+        print("Telegram message sent successfully.")
 
-    send_telegram(message)
-    print("Signal sent to Telegram.")
+    except Exception as error:
+        print(f"ERROR: {type(error).__name__}: {error}")
+        raise
 
 
 if __name__ == "__main__":
     main()
-
