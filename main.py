@@ -6,8 +6,8 @@ import urllib.request
 from datetime import datetime, timezone
 
 
-BINANCE_URL = "https://api.binance.com/api/v3/klines"
-SYMBOL = "BTCUSDT"
+COINBASE_URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+SYMBOL = SYMBOL = "BTC-USD"
 INTERVAL = "15m"
 
 
@@ -62,23 +62,30 @@ def rsi(values, period=14):
     return result
 
 
+
 def get_candles():
     query = urllib.parse.urlencode({
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "limit": 200
+        "granularity": 900
     })
 
-    candles = get_json(f"{BINANCE_URL}?{query}")
+    candles = get_json(f"{COINBASE_URL}?{query}")
 
-    # Ignore the latest candle because it may still be forming.
-    candles = candles[:-1]
+    # Coinbase returns: time, low, high, open, close, volume
+    candles = sorted(candles, key=lambda c: c[0])
+
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    # Keep only fully closed 15-minute candles.
+    candles = [c for c in candles if int(c[0]) + 900 <= now]
+
+    if len(candles) < 60:
+        raise RuntimeError("Not enough closed candles received.")
 
     return {
-        "time": [c[0] for c in candles],
-        "open": [float(c[1]) for c in candles],
+        "time": [int(c[0]) * 1000 for c in candles],
+        "open": [float(c[3]) for c in candles],
         "high": [float(c[2]) for c in candles],
-        "low": [float(c[3]) for c in candles],
+        "low": [float(c[1]) for c in candles],
         "close": [float(c[4]) for c in candles],
     }
 
@@ -194,7 +201,7 @@ def main():
         return
 
     message = (
-        f"BTCUSDT | {signal['side']}\n"
+        f"BTC-USD | {signal['side']}\n"
         f"Timeframe: 15m\n"
         f"Entry reference: {signal['price']:.2f}\n"
         f"Stop-loss reference: {signal['stop']:.2f}\n"
