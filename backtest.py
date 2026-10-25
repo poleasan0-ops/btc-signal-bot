@@ -3,26 +3,27 @@ import json
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
+from collections import defaultdict
 
 URL = "https://api.exchange.coinbase.com/products/BTC-USD/candles"
+
 GRANULARITY = 300
 INITIAL_BALANCE = 1000.0
 DAYS = 30
 
-# فرض‌های هزینه؛ قبل از استفاده واقعی باید با شرایط صرافی تطبیق داده شوند.
 FEE_RATE = 0.0005
 SLIPPAGE_RATE = 0.0002
 SPREAD_RATE = 0.0002
 
-# ریسک و هدف بر حسب فاصله قیمت ورود
 RISK_FRACTION = 0.005
 REWARD_RISK = 1.5
+MAX_NOTIONAL_FRACTION = 1.0
 
 
 def get_candles():
-    all_candles = {}
     end = int(datetime.now(timezone.utc).timestamp())
     start = end - DAYS * 86400
+    all_candles = {}
     cursor = start
 
     while cursor < end:
@@ -38,50 +39,65 @@ def get_candles():
         })
         request = urllib.request.Request(
             f"{URL}?{params}",
-            headers={"User-Agent": "BTC-Scalp-Backtest/3.0"},
+            headers={"User-Agent": "BTC-Backtest/4.0"},
         )
 
         with urllib.request.urlopen(request, timeout=30) as response:
             data = json.loads(response.read().decode("utf-8"))
 
-        if isinstance(data, dict):
-            raise RuntimeError(f"Coinbase API error: {data}")
+        if not isinstance(data, list):
+            raise RuntimeError(f"API response error: {data}")
 
-        for candle in data:
-            if candle[0] + GRANULARITY <= end:
-                all_candles[candle[0]] = candle
+        for c in data:
+            if len(c) >= 6:
+                ts = int(c[0])
+                if start <= ts and ts + GRANULARITY <= end:
+                    all_candles[ts] = [
+                        ts, float(c[1]), float(c[2]),
+                        float(c[3]), float(c[4]), float(c[5])
+                    ]
 
         cursor = chunk_end
 
-    candles = [all_candles[t] for t in sorted(all_candles)]
+    raw = [all_candles[t] for t in sorted(all_candles)]
 
-    # فقط کندل‌های متوالی؛ حذف شکاف‌های داده
-    return [
-        candle for i, candle in enumerate(candles)
-        if i == 0 or candle[0] == candles[i - 1][0] + GRANULARITY
-    ]
+    # Split data into continuous segments. Indicators never cross gaps.
+    segments = []
+    current = []
+
+    for c in raw:
+        if current and c[0] != current[-1][0] + GRANULARITY:
+            if current:
+                segments.append(current)
+            current = []
+        current.append(c)
+
+    if current:
+        segments.append(current)
+
+    return segments
 
 
 def ema(values, period):
-    result = [None] * len(values)
+    out = [None] * len(values)
     if len(values) < period:
-        return result
+        return out
 
-    current = sum(values[:period]) / period
-    result[period - 1] = current
+    value = sum(values[:period]) / period
+    out[period - 1] = value
     alpha = 2 / (period + 1)
 
     for i in range(period, len(values)):
-        current = alpha * values[i] + (1 - alpha) * current
-        result[i] = current
+        value = alpha * values[i] + (1 - alpha) * value
+        out[i] = value
 
-    return result
+    return out
 
 
 def rsi(values, period=14):
-    result = [None] * len(values)
+    out = [None] * len(values)
     if len(values) <= period:
-        return result
+        return out
 
     changes = [
         values[i] - values[i - 1]
@@ -93,86 +109,61 @@ def rsi(values, period=14):
     avg_gain = sum(gains[:period]) / period
     avg_loss = sum(losses[:period]) / period
 
-    def value(gain, loss):
-        if loss == 0:
-            return 100.0 if gain > 0 else 50.0
-        return 100 - 100 / (1 + gain / loss)
+    def calc(g, l):
+        if l == 0:
+            return 100.0 if g > 0 else 50.0
+        return 100 - 100 / (1 + g / l)
 
-    result[period] = value(avg_gain, avg_loss)
+    out[period] = calc(avg_gain, avg_loss)
 
     for i in range(period + 1, len(values)):
-        change_index = i - 1
-        avg_gain = (
-            avg_gain * (period - 1) + gains[change_index]
-        ) / period
-        avg_loss = (
-            avg_loss * (period - 1) + losses[change_index]
-        ) / period
-        result[i] = value(avg_gain, avg_loss)
+        k = i - 1
+        avg_gain = (avg_gain * (period - 1) + gains[k]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[k]) / period
+        out[i] = calc(avg_gain, avg_loss)
 
-    return result
+    return out
 
 
-def aggregate_15m(candles):
-    groups = {}
-    for candle in candles:
-        bucket = candle[0] - candle[0] % 900
-        groups.setdefault(bucket, []).append(candle)
+def build_15m(segment):
+    groups = defaultdict(list)
 
-    result = {}
+    for c in segment:
+        bucket = c[0] - c[0] % 900
+        groups[bucket].append(c)
+
+    bars = {}
+
     for bucket, rows in groups.items():
         rows.sort(key=lambda x: x[0])
-        if len(rows) != 3:
-            continue
-        if [r[0] for r in rows] != [
-            bucket, bucket + 300, bucket + 600
-        ]:
+        expected = [bucket, bucket + 300, bucket + 600]
+
+        if [r[0] for r in rows] != expected:
             continue
 
-        result[bucket] = {
-            "open": float(rows[0][3]),
-            "high": max(float(r[2]) for r in rows),
-            "low": min(float(r[1]) for r in rows),
-            "close": float(rows[-1][4]),
+        bars[bucket] = {
+            "close": rows[-1][4],
         }
-    return result
+
+    return bars
 
 
-def main():
-    candles = get_candles()
-    if len(candles) < 500:
-        raise RuntimeError(
-            f"Not enough continuous 5-minute candles: {len(candles)}"
-        )
+def backtest_segment(segment, state):
+    if len(segment) < 100:
+        return
 
-    closes = [float(c[4]) for c in candles]
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[1]) for c in candles]
-    opens = [float(c[3]) for c in candles]
-    times = [int(c[0]) for c in candles]
-
-    # 15-minute trend: use only the last fully closed 15-minute bar.
-    bars15 = aggregate_15m(candles)
-    times15 = sorted(bars15)
-    close15 = [bars15[t]["close"] for t in times15]
-    trend_fast = ema(close15, 20)
-    trend_slow = ema(close15, 50)
-
-    trend_by_time = {}
-    for j, t in enumerate(times15):
-        if trend_fast[j] is not None and trend_slow[j] is not None:
-            trend_by_time[t + 900] = (
-                trend_fast[j] > trend_slow[j],
-                trend_fast[j] < trend_slow[j],
-            )
+    times = [c[0] for c in segment]
+    opens = [c[3] for c in segment]
+    highs = [c[2] for c in segment]
+    lows = [c[1] for c in segment]
+    closes = [c[4] for c in segment]
 
     fast = ema(closes, 20)
     slow = ema(closes, 50)
-    momentum = rsi(closes, 14)
+    rsi_values = rsi(closes, 14)
 
-    # ATR(14), using only historical bars.
     tr = []
-    for i in range(len(candles)):
+    for i in range(len(segment)):
         if i == 0:
             tr.append(highs[i] - lows[i])
         else:
@@ -181,41 +172,48 @@ def main():
                 abs(highs[i] - closes[i - 1]),
                 abs(lows[i] - closes[i - 1]),
             ))
+
     atr = ema(tr, 14)
 
-    balance = INITIAL_BALANCE
-    peak_equity = balance
-    max_drawdown = 0.0
-    position = None
-    trades = []
-    equity_curve = []
+    bars15 = build_15m(segment)
+    times15 = sorted(bars15)
+    closes15 = [bars15[t]["close"] for t in times15]
+    ema20_15 = ema(closes15, 20)
+    ema50_15 = ema(closes15, 50)
 
-    # Enter at next bar open; no same-bar signal execution.
-    for i in range(60, len(candles) - 1):
-        if fast[i] is None or slow[i] is None:
+    trend = {}
+    for j, t in enumerate(times15):
+        if ema20_15[j] is not None and ema50_15[j] is not None:
+            # Available only after the 15m candle has closed.
+            trend[t + 900] = (
+                ema20_15[j] > ema50_15[j],
+                ema20_15[j] < ema50_15[j],
+            )
+
+    for i in range(60, len(segment) - 1):
+        if any(x[i] is None for x in (fast, slow, rsi_values, atr)):
             continue
-        if momentum[i] is None or atr[i] is None or atr[i] <= 0:
+        if atr[i] <= 0:
             continue
 
-        # Map to the latest fully completed 15m bar.
         bucket = times[i] - times[i] % 900
-        trend = trend_by_time.get(bucket)
-        if trend is None:
+        current_trend = trend.get(bucket)
+
+        if current_trend is None:
             continue
 
-        uptrend, downtrend = trend
+        uptrend, downtrend = current_trend
         candle_range = highs[i] - lows[i]
+
         if candle_range <= 0:
             continue
 
-        # Stronger filters: trend alignment, pullback reclaim,
-        # momentum and close near the candle's directional extreme.
         buy = (
             uptrend
             and fast[i] > slow[i]
             and closes[i] > fast[i]
             and closes[i - 1] <= fast[i - 1]
-            and 52 <= momentum[i] <= 65
+            and 52 <= rsi_values[i] <= 65
             and closes[i] >= lows[i] + 0.70 * candle_range
         )
 
@@ -224,161 +222,155 @@ def main():
             and fast[i] < slow[i]
             and closes[i] < fast[i]
             and closes[i - 1] >= fast[i - 1]
-            and 35 <= momentum[i] <= 48
+            and 35 <= rsi_values[i] <= 48
             and closes[i] <= highs[i] - 0.70 * candle_range
         )
 
+        position = state["position"]
         next_open = opens[i + 1]
-        timestamp = times[i + 1]
+        next_high = highs[i + 1]
+        next_low = lows[i + 1]
+        next_time = times[i + 1]
 
-        # Conservative single-position simulation, long and short.
-        if position is None and (buy or sell):
+        if position is None:
+            if not (buy or sell):
+                continue
+
             direction = 1 if buy else -1
             entry = next_open * (
                 1 + direction * (SPREAD_RATE / 2 + SLIPPAGE_RATE)
             )
+
             stop_distance = max(atr[i] * 1.2, entry * 0.001)
-            risk_cash = balance * RISK_FRACTION
-            units = risk_cash / stop_distance
+            risk_cash = state["balance"] * RISK_FRACTION
+            units_by_risk = risk_cash / stop_distance
+            units_by_capital = (
+                state["balance"] * MAX_NOTIONAL_FRACTION
+                / (entry * (1 + FEE_RATE))
+            )
+            units = min(units_by_risk, units_by_capital)
 
-            # Reserve both entry cost and estimated entry fee.
-            entry_cost = units * entry
-            entry_fee = entry_cost * FEE_RATE
-            if entry_cost + entry_fee > balance:
-                units = balance / (entry * (1 + FEE_RATE))
-                entry_cost = units * entry
-                entry_fee = entry_cost * FEE_RATE
+            if units <= 0:
+                continue
 
-            stop = entry - direction * stop_distance
-            target = entry + direction * stop_distance * REWARD_RISK
+            entry_fee = units * entry * FEE_RATE
 
-            position = {
+            state["position"] = {
                 "direction": direction,
                 "entry": entry,
-                "entry_time": timestamp,
+                "time": next_time,
                 "units": units,
                 "entry_fee": entry_fee,
-                "stop": stop,
-                "target": target,
-                "balance_before": balance,
+                "stop": entry - direction * stop_distance,
+                "target": entry + direction * stop_distance * REWARD_RISK,
             }
+            continue
 
-        elif position is not None:
-            direction = position["direction"]
+        direction = position["direction"]
 
-            # Use intrabar high/low for stop and target. If both hit,
-            # assume stop first (conservative).
-            stop_hit = (
-                lows[i + 1] <= position["stop"]
-                if direction == 1
-                else highs[i + 1] >= position["stop"]
-            )
-            target_hit = (
-                highs[i + 1] >= position["target"]
-                if direction == 1
-                else lows[i + 1] <= position["target"]
-            )
-
-            exit_price = None
-            exit_reason = None
-
-            if stop_hit:
-                exit_price = position["stop"]
-                exit_reason = "STOP"
-            elif target_hit:
-                exit_price = position["target"]
-                exit_reason = "TARGET"
-            elif (
-                (direction == 1 and (sell or downtrend))
-                or (direction == -1 and (buy or uptrend))
-            ):
-                exit_price = next_open
-                exit_reason = "SIGNAL"
-
-            if exit_price is not None:
-                exit_price *= (
-                    1 - direction * (SPREAD_RATE / 2 + SLIPPAGE_RATE)
-                )
-                gross_pnl = (
-                    (exit_price - position["entry"])
-                    * position["units"] * direction
-                )
-                exit_fee = (
-                    exit_price * position["units"] * FEE_RATE
-                )
-                pnl = gross_pnl - exit_fee - position["entry_fee"]
-                balance += pnl
-
-                trades.append({
-                    "pnl": pnl,
-                    "reason": exit_reason,
-                })
-                position = None
-
-        mark = closes[i + 1]
-        equity = balance
-        if position is not None:
-            unrealized = (
-                (mark - position["entry"])
-                * position["units"] * position["direction"]
-                - position["entry_fee"]
-            )
-            equity = balance + unrealized
-
-        peak_equity = max(peak_equity, equity)
-        if peak_equity > 0:
-            max_drawdown = max(
-                max_drawdown, (peak_equity - equity) / peak_equity
-            )
-        equity_curve.append(equity)
-
-    final_equity = balance
-    if position is not None:
-        final_equity += (
-            (closes[-1] - position["entry"])
-            * position["units"] * position["direction"]
-            - position["entry_fee"]
+        stop_hit = (
+            next_low <= position["stop"]
+            if direction == 1
+            else next_high >= position["stop"]
+        )
+        target_hit = (
+            next_high >= position["target"]
+            if direction == 1
+            else next_low <= position["target"]
         )
 
+        exit_price = None
+        reason = None
+
+        # If a candle touches both, count the stop first.
+        if stop_hit:
+            exit_price = position["stop"]
+            reason = "STOP"
+        elif target_hit:
+            exit_price = position["target"]
+            reason = "TARGET"
+        elif (
+            (direction == 1 and (sell or downtrend))
+            or (direction == -1 and (buy or uptrend))
+        ):
+            exit_price = next_open
+            reason = "SIGNAL"
+
+        if exit_price is None:
+            continue
+
+        # Conservative fill adjustment for modeled spread/slippage.
+        exit_price *= (
+            1 - direction * (SPREAD_RATE / 2 + SLIPPAGE_RATE)
+        )
+
+        gross = (
+            (exit_price - position["entry"])
+            * position["units"] * direction
+        )
+        exit_fee = exit_price * position["units"] * FEE_RATE
+        pnl = gross - exit_fee - position["entry_fee"]
+
+        state["balance"] += pnl
+        state["trades"].append({
+            "pnl": pnl,
+            "reason": reason,
+            "entry_time": position["time"],
+            "exit_time": next_time,
+        })
+        state["position"] = None
+
+
+def main():
+    segments = get_candles()
+    total = sum(len(s) for s in segments)
+
+    if total < 500:
+        raise RuntimeError(
+            f"Not enough data: {total} candles across "
+            f"{len(segments)} continuous segments."
+        )
+
+    state = {
+        "balance": INITIAL_BALANCE,
+        "position": None,
+        "trades": [],
+    }
+
+    for segment in segments:
+        # Never carry an open position across a data gap.
+        if state["position"] is not None:
+            state["position"] = None
+        backtest_segment(segment, state)
+
+    trades = state["trades"]
     wins = [t for t in trades if t["pnl"] > 0]
     losses = [t for t in trades if t["pnl"] < 0]
+
     gross_wins = sum(t["pnl"] for t in wins)
     gross_losses = -sum(t["pnl"] for t in losses)
-    profit_factor = (
-        gross_wins / gross_losses if gross_losses > 0 else None
-    )
+    pf = gross_wins / gross_losses if gross_losses else None
 
-    print("BTC-USD 5m/15m experimental scalp backtest")
-    print(f"Candles: {len(candles)}")
-    print(f"Start: {datetime.fromtimestamp(times[0], timezone.utc)}")
-    print(f"End:   {datetime.fromtimestamp(times[-1], timezone.utc)}")
+    print("BTC-USD 5m/15m historical signal test")
+    print(f"Data candles: {total}")
+    print(f"Continuous segments: {len(segments)}")
     print(f"Initial balance: ${INITIAL_BALANCE:.2f}")
-    print(f"Closed balance: ${balance:.2f}")
-    print(f"Final equity including open P/L: ${final_equity:.2f}")
+    print(f"Closed balance: ${state['balance']:.2f}")
     print(
-        f"Equity return: "
-        f"{(final_equity / INITIAL_BALANCE - 1) * 100:.2f}%"
+        f"Return: "
+        f"{(state['balance'] / INITIAL_BALANCE - 1) * 100:.2f}%"
     )
     print(f"Closed trades: {len(trades)}")
     print(f"Wins: {len(wins)}")
     print(f"Losses: {len(losses)}")
     print(
-        f"Win rate: {len(wins) / len(trades) * 100:.2f}%"
+        f"Win rate: {100 * len(wins) / len(trades):.2f}%"
         if trades else "Win rate: N/A"
     )
-    print(
-        f"Profit factor: {profit_factor:.2f}"
-        if profit_factor is not None else "Profit factor: N/A"
-    )
-    print(f"Maximum equity drawdown: {max_drawdown * 100:.2f}%")
-    if position:
-        print("Open position at end: Yes (unrealized P/L included in equity)")
-    else:
-        print("Open position at end: None")
-    print(
-        "Experimental only: costs are assumptions; results do not "
-        "guarantee future performance."
-    )
+    print(f"Profit factor: {pf:.2f}" if pf is not None else
+          "Profit factor: N/A")
+    print("Fees, spread and slippage are estimates.")
+    print("This test is experimental and does not predict future results.")
 
 
 if __name__ == "__main__":
